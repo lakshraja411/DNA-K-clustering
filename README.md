@@ -107,3 +107,31 @@ The multi-salt page now shows:
 - family-resolved dwell with event-level IQR;
 - family-resolved blockade with event-level IQR;
 - dwell and blockade heatmaps.
+
+
+## v3 additions
+
+- Cluster and salt summary tables now report both **mean and median** for dwell, blockade, FWHM and area where relevant.
+- Dwell/blockade histograms show both:
+  - solid vertical line = mean
+  - dashed vertical line = median
+- Waveform family plots can show **Mean**, **Median**, or **Both** representative profiles.
+- Cross-salt family waveform comparison can use either mean or median representative profiles.
+- Cross-salt family dwell/blockade plots can display:
+  - Median + IQR
+  - Mean ± SD
+  - Mean ± SEM
+- Segment-weighted analysis is now distribution-first:
+  - individual-salt weighted ΔI histograms
+  - individual-salt total segmented dwell histograms
+  - combined all-salt overlaid histograms
+  - all-salt error-bar summaries using median+IQR, mean±SD, or mean±SEM
+  - all-salt weighted ΔI versus segmented dwell scatter
+- Reusable **Edit plot appearance** controls were added throughout the main analysis:
+  - plot title
+  - x-axis title
+  - y-axis title
+  - x min / x max
+  - y min / y max
+  - histogram bin count where relevant
+  - optional log axes on applicable scatter plots
