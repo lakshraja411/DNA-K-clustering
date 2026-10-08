@@ -135,3 +135,15 @@ The multi-salt page now shows:
   - y min / y max
   - histogram bin count where relevant
   - optional log axes on applicable scatter plots
+
+
+## v3.1 fix
+
+- Fixed a multi-salt `KeyError` caused by stale/older cross-salt summary tables after a deployment update.
+- Cross-salt statistics are now recomputed directly from the current cluster assignments before rendering.
+- Added app-state schema versioning so old Streamlit session results are cleared after this update.
+- Waveform family plots are median-only again:
+  - grey = real member traces
+  - representative = pointwise median
+  - no mean waveform option
+- Mean and median are still retained for scalar quantities such as dwell time, blockade, FWHM, area and segment-weighted summaries.

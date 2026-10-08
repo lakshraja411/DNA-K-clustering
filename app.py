@@ -37,6 +37,22 @@ st.caption(
     "NanoSense scalar features → reproducible K-means → waveform families → physical plots → current gates → segment-weighted analysis"
 )
 
+APP_STATE_VERSION = "3.1"
+if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
+    # Results from older deployed code can have a different summary-table schema.
+    # Clear only computed analysis state; uploaded widgets themselves remain in the page.
+    for _key in [
+        "loaded",
+        "cluster_result",
+        "multi_compare",
+        "cluster_export_blob",
+        "gate_export_blob",
+        "gate_groups",
+        "gate_table",
+    ]:
+        st.session_state.pop(_key, None)
+    st.session_state["_app_state_version"] = APP_STATE_VERSION
+
 # -----------------------------
 # session state
 # -----------------------------
@@ -344,7 +360,8 @@ def get_waveform_family_data(recording, assignments, window_samples=850, min_cov
     return info, medians
 
 
-def plot_waveform_family_panels(info, medians, x_mode="time", max_members_per_cluster=50, representative="Both"):
+def plot_waveform_family_panels(info, medians, x_mode="time", max_members_per_cluster=50):
+    """Real member traces plus the pointwise median representative only."""
     if info is None or not medians:
         return None, None
 
@@ -355,35 +372,33 @@ def plot_waveform_family_panels(info, medians, x_mode="time", max_members_per_cl
     ncols = 2 if n > 1 else 1
     nrows = int(np.ceil(n / ncols))
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 3.6 * nrows), squeeze=False)
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(7 * ncols, 3.6 * nrows),
+        squeeze=False
+    )
     axes = axes.ravel()
 
     for ax in axes[n:]:
         ax.axis("off")
 
-    rep_data = {}
     for ax, c in zip(axes, clusters):
         item = medians[c]
         members = item["members"]
         show_n = min(max_members_per_cluster, len(members))
+
         if show_n > 0:
             step = max(1, len(members) // show_n)
             sample = members[::step][:show_n]
             for prof in sample:
                 ax.plot(x, prof, color="gray", alpha=0.10, linewidth=0.8)
 
-        coverage = np.sum(np.isfinite(members), axis=0)
-        threshold = max(1, int(np.ceil(0.5 * len(members))))
-        mean_profile = np.nanmean(members, axis=0)
-        mean_profile[coverage < threshold] = np.nan
-        median_profile = item["median"]
-        rep_data[c] = {"mean": mean_profile, "median": median_profile}
-
-        if representative in ("Mean", "Both"):
-            ax.plot(x, mean_profile, linewidth=2.0, label="Mean representative")
-        if representative in ("Median", "Both"):
-            ax.plot(x, median_profile, linewidth=2.0, linestyle="--" if representative == "Both" else "-", label="Median representative")
-
+        ax.plot(
+            x,
+            item["median"],
+            linewidth=2.2,
+            label="Median representative"
+        )
         ax.set_title(f"Cluster {c} · n={item['n']}")
         ax.set_xlabel(xlabel)
         ax.set_ylabel("Blockade (nA)")
@@ -393,15 +408,18 @@ def plot_waveform_family_panels(info, medians, x_mode="time", max_members_per_cl
 
     overlay, ax = plt.subplots(figsize=(10, 4.8))
     for c in clusters:
-        if representative in ("Mean", "Both"):
-            ax.plot(x, rep_data[c]["mean"], linewidth=2, label=f"Cluster {c} mean")
-        if representative in ("Median", "Both"):
-            ax.plot(x, rep_data[c]["median"], linewidth=2, linestyle="--" if representative == "Both" else "-", label=f"Cluster {c} median")
+        ax.plot(
+            x,
+            medians[c]["median"],
+            linewidth=2.0,
+            label=f"Cluster {c}"
+        )
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Representative blockade (nA)")
-    ax.set_title("Representative profiles overlaid")
-    ax.legend()
+    ax.set_ylabel("Median blockade (nA)")
+    ax.set_title("Median representative profiles overlaid")
+    ax.legend(frameon=False)
     overlay.tight_layout()
+
     return fig, overlay
 
 
@@ -638,16 +656,19 @@ def salt_errorbar_summary(summary, metric, center_mode, title, ylabel):
 
 
 def mapped_cross_salt_stats(results_by_salt, mapping):
+    """Recompute the current summary schema from assignments, then apply family mapping."""
     rows = []
     for salt, item in results_by_salt.items():
-        stats = item["stats"].copy()
+        stats = cross_salt_cluster_stats(item["result"]["assignments"], salt)
+        item["stats"] = stats
         m = mapping.get(salt, {})
         stats["family"] = stats["cluster"].map(lambda c: m.get(int(c), "Unmapped"))
         rows.append(stats)
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-def cross_salt_profile_figure(results_by_salt, mapping, x_mode="time", statistic="Median"):
+def cross_salt_profile_figure(results_by_salt, mapping, x_mode="time"):
+    """Matched pointwise-median waveform families across salts."""
     families = sorted(
         {
             fam
@@ -681,6 +702,7 @@ def cross_salt_profile_figure(results_by_salt, mapping, x_mode="time", statistic
             }
             if fam not in inverse:
                 continue
+
             cluster = inverse[fam]
             info = item.get("profile_info")
             medians = item.get("medians") or {}
@@ -688,15 +710,12 @@ def cross_salt_profile_figure(results_by_salt, mapping, x_mode="time", statistic
                 continue
 
             x = info["time_ms"] if x_mode == "time" else info["data_index"]
-            members = medians[cluster]["members"]
-            coverage = np.sum(np.isfinite(members), axis=0)
-            threshold = max(1, int(np.ceil(0.5 * len(members))))
-            if statistic == "Mean":
-                representative = np.nanmean(members, axis=0)
-                representative[coverage < threshold] = np.nan
-            else:
-                representative = medians[cluster]["median"]
-            ax.plot(x, representative, linewidth=2, label=salt)
+            ax.plot(
+                x,
+                medians[cluster]["median"],
+                linewidth=2.0,
+                label=salt,
+            )
 
         ax.set_title(f"Family {fam}")
         ax.set_xlabel(
@@ -704,10 +723,10 @@ def cross_salt_profile_figure(results_by_salt, mapping, x_mode="time", statistic
             if x_mode == "time"
             else "Centered data index"
         )
-        ax.set_ylabel(f"{statistic} blockade (nA)")
+        ax.set_ylabel("Median blockade (nA)")
         ax.legend(frameon=False)
 
-    fig.suptitle(f"Matched DNA event families across salts · {statistic}", y=1.01)
+    fig.suptitle("Matched median DNA event families across salts", y=1.01)
     fig.tight_layout()
     return fig
 
@@ -1200,19 +1219,13 @@ with tabs[1]:
                         xlab,
                         "Blockade (nA)",
                     )
-                    representative = st.radio(
-                        "Representative profile",
-                        ["Both", "Median", "Mean"],
-                        horizontal=True,
-                        key="single_waveform_rep",
-                    )
                     fig_panels, fig_overlay = plot_waveform_family_panels(
-                        info, medians, x_mode=x_mode, representative=representative
+                        info, medians, x_mode=x_mode
                     )
                     apply_figure_editor(fig_panels, opts, title_as_suptitle=True)
                     st.pyplot(fig_panels, use_container_width=True)
                     st.caption(
-                        "Grey curves are real member traces; the selected mean/median representative profile is overlaid."
+                        "Grey curves are real member traces; the pointwise median representative profile is overlaid."
                     )
                     opts2 = plot_editor(
                         "single_waveform_overlay",
@@ -1818,6 +1831,7 @@ with tabs[5]:
                 m3.metric("Davies–Bouldin", f'{result["diagnostics"]["davies_bouldin"]:.3f}')
                 m4.metric("Events", len(valid))
 
+                item["stats"] = cross_salt_cluster_stats(assignments, salt)
                 st.dataframe(item["stats"].round(4), use_container_width=True)
 
                 wtab, bdtab, htab, ptab, stab = st.tabs(
@@ -1839,17 +1853,10 @@ with tabs[5]:
                             xlab,
                             "Blockade (nA)",
                         )
-                        representative = st.radio(
-                            "Representative profile",
-                            ["Both", "Median", "Mean"],
-                            horizontal=True,
-                            key=f"multi_{salt}_waveform_rep",
-                        )
                         family_panels, overlay = plot_waveform_family_panels(
                             item["profile_info"],
                             item["medians"],
                             x_mode=mc["x_mode"],
-                            representative=representative,
                         )
                         apply_figure_editor(family_panels, opts, title_as_suptitle=True)
                         st.pyplot(family_panels, use_container_width=True)
@@ -2034,14 +2041,14 @@ with tabs[5]:
         stats = mapped_cross_salt_stats(results_by_salt, mapping)
 
         st.subheader("Matched family summary · mean + median")
+        summary_columns = [
+            "salt", "cluster", "family", "n", "population_pct",
+            "mean_dwell_ms", "median_dwell_ms", "std_dwell_ms", "sem_dwell_ms", "q1_dwell_ms", "q3_dwell_ms",
+            "mean_blockade_nA", "median_blockade_nA", "std_blockade_nA", "sem_blockade_nA", "q1_blockade_nA", "q3_blockade_nA",
+        ]
+        available_summary_columns = [c for c in summary_columns if c in stats.columns]
         st.dataframe(
-            stats[
-                [
-                    "salt", "cluster", "family", "n", "population_pct",
-                    "mean_dwell_ms", "median_dwell_ms", "std_dwell_ms", "sem_dwell_ms", "q1_dwell_ms", "q3_dwell_ms",
-                    "mean_blockade_nA", "median_blockade_nA", "std_blockade_nA", "sem_blockade_nA", "q1_blockade_nA", "q3_blockade_nA",
-                ]
-            ].round(4),
+            stats[available_summary_columns].round(4),
             use_container_width=True,
         )
 
@@ -2067,21 +2074,14 @@ with tabs[5]:
         xlab = "Time relative to event midpoint (ms)" if mc["x_mode"] == "time" else "Centered data index"
         opts = plot_editor(
             "cross_family_profiles",
-            "Matched DNA event families across salts",
+            "Matched median DNA event families across salts",
             xlab,
             "Median blockade (nA)",
-        )
-        waveform_statistic = st.radio(
-            "Cross-salt representative waveform",
-            ["Median", "Mean"],
-            horizontal=True,
-            key="cross_waveform_stat",
         )
         family_fig = cross_salt_profile_figure(
             results_by_salt,
             mapping,
             x_mode=mc["x_mode"],
-            statistic=waveform_statistic,
         )
         if family_fig is not None:
             apply_figure_editor(family_fig, opts, title_as_suptitle=True)
