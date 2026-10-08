@@ -87,3 +87,23 @@ Exported subsets preserve original dataset rows and event-indexed arrays where m
   - runs the same K-means settings on each salt
   - compares family-resolved blockade and dwell across salts
   - compares matched median family shapes across salts
+
+
+## Multi-salt upload fix
+
+The multi-salt page now uses explicit three-file upload slots for LiCl, NaCl, KCl, RbCl and CsCl.
+It no longer assumes that dataset, event-data and event-fitting filenames have identical timestamps.
+
+The multi-salt page now shows:
+- full individual plots for every loaded salt;
+- cluster waveform family panels and overlay;
+- blockade-vs-dwell plots;
+- dwell and blockade histograms;
+- population fractions;
+- explicit user-confirmed mapping from salt-specific clusters to common Family A/B/C... labels;
+- combined shared-axis blockade–dwell panels;
+- matched waveform-family profiles across salts;
+- family population fractions;
+- family-resolved dwell with event-level IQR;
+- family-resolved blockade with event-level IQR;
+- dwell and blockade heatmaps.
