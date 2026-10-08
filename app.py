@@ -1,6 +1,6 @@
 
 import io
-import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +10,6 @@ import streamlit as st
 
 from core import (
     FEATURE_NAMES,
-    FEATURE_LABELS,
     read_uploaded_bytes,
     load_dataset,
     dataset_table,
@@ -35,14 +34,306 @@ from core import (
 st.set_page_config(page_title="DNA K-Means Workbench", layout="wide")
 st.title("DNA K-Means Workbench")
 st.caption(
-    "NanoSense scalar features → reproducible K-means → physical plots → current gates → segment-weighted analysis"
+    "NanoSense scalar features → reproducible K-means → waveform families → physical plots → current gates → segment-weighted analysis"
 )
 
-if "loaded" not in st.session_state:
-    st.session_state.loaded = None
-if "cluster_result" not in st.session_state:
-    st.session_state.cluster_result = None
+# -----------------------------
+# session state
+# -----------------------------
+for key, default in {
+    "loaded": None,
+    "cluster_result": None,
+    "multi_compare": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
+
+# -----------------------------
+# helpers
+# -----------------------------
+def load_recording(dataset_blob, eventdata_blob, fitting_blob, dataset_name, eventdata_name, fitting_name, tolerance):
+    X, dataset_arrays = load_dataset(dataset_blob)
+    eventdata_arrays = npz_to_dict(eventdata_blob, allow_pickle=True)
+    fitting_arrays = npz_to_dict(fitting_blob, allow_pickle=True)
+
+    df = dataset_table(X)
+
+    fit_to_dataset, ds_status = map_fitting_to_dataset(
+        fitting_arrays, X, tolerance=float(tolerance)
+    )
+    fit_to_raw, raw_status = map_fitting_to_raw(
+        fitting_arrays, eventdata_arrays, tolerance=float(tolerance)
+    )
+
+    row_to_fit = {int(row): int(fid) for fid, row in fit_to_dataset.items()}
+    df["event_id"] = [row_to_fit.get(int(i), np.nan) for i in df["dataset_row"]]
+
+    return dict(
+        X=X,
+        df=df,
+        dataset_arrays=dataset_arrays,
+        eventdata_arrays=eventdata_arrays,
+        fitting_arrays=fitting_arrays,
+        fit_to_dataset=fit_to_dataset,
+        fit_to_raw=fit_to_raw,
+        ds_status=ds_status,
+        raw_status=raw_status,
+        source_names=dict(
+            dataset=dataset_name,
+            eventdata=eventdata_name,
+            fitting=fitting_name,
+        ),
+    )
+
+
+def run_kmeans_pipeline(recording, mode, manual_k, kmax, n_init, random_state):
+    df = recording["df"].copy()
+    X_features = df[FEATURE_NAMES].to_numpy(float)
+    finite_mask = np.all(np.isfinite(X_features), axis=1)
+
+    X_valid = X_features[finite_mask]
+    valid_df = df.loc[finite_mask].copy().reset_index(drop=True)
+    if len(valid_df) < 3:
+        raise ValueError("Too few valid events for clustering.")
+
+    X_scaled, feature_min, feature_max, constant = minmax_scale(X_valid)
+    scan = scan_k(
+        X_scaled,
+        k_min=2,
+        k_max=int(kmax),
+        n_init=int(n_init),
+        max_iter=2000,
+        random_state=int(random_state),
+    )
+    if len(scan) == 0:
+        raise ValueError("k scan failed. Check that enough events remain after filtering.")
+
+    if mode == "Silhouette":
+        k = int(scan.loc[scan["silhouette"].idxmax(), "k"])
+    else:
+        k = int(manual_k)
+
+    labels, centers, inertia = kmeans_numpy(
+        X_scaled,
+        k,
+        n_init=int(n_init),
+        max_iter=2000,
+        random_state=int(random_state),
+    )
+
+    labels, label_mapping = reorder_labels_by_height(valid_df, labels)
+    diag = clustering_diagnostics(X_scaled, labels)
+
+    assignments = df.copy()
+    assignments["cluster"] = -1
+    assignments.loc[finite_mask, "cluster"] = labels
+
+    scores, explained, loadings = pca_numpy(X_scaled)
+
+    return dict(
+        k=k,
+        labels=labels,
+        assignments=assignments,
+        valid_mask=finite_mask,
+        valid_df=valid_df,
+        X_scaled=X_scaled,
+        scan=scan,
+        diagnostics=diag,
+        inertia=inertia,
+        scores=scores,
+        explained=explained,
+        loadings=loadings,
+        feature_min=feature_min,
+        feature_max=feature_max,
+        constant=constant,
+        n_init=int(n_init),
+        random_state=int(random_state),
+        mode=mode,
+    )
+
+
+def cluster_summary_table(assignments):
+    valid = assignments[assignments["cluster"] >= 0].copy()
+    summary = (
+        valid.groupby("cluster")
+        .agg(
+            n=("cluster", "size"),
+            median_blockade_nA=("height_nA", "median"),
+            median_fwhm_ms=("fwhm_ms", "median"),
+            median_dwell_ms=("width_ms", "median"),
+            median_area_nA_ms=("area_nA_ms", "median"),
+            median_fwhm_fraction=("fwhm_fraction", "median"),
+            median_skew=("skew", "median"),
+            median_kurtosis=("kurtosis", "median"),
+        )
+        .reset_index()
+    )
+    summary["population_pct"] = 100 * summary["n"] / summary["n"].sum()
+    return summary
+
+
+def build_labels_by_event(recording, assignments):
+    row_to_fit = {int(row): int(fid) for fid, row in recording["fit_to_dataset"].items()}
+    valid = assignments[assignments["cluster"] >= 0].copy()
+    labels_by_event = {}
+    for _, row in valid.iterrows():
+        dsrow = int(row["dataset_row"])
+        if dsrow in row_to_fit:
+            labels_by_event[row_to_fit[dsrow]] = int(row["cluster"])
+    return labels_by_event
+
+
+def get_waveform_family_data(recording, assignments, window_samples=850, min_coverage_fraction=0.5):
+    labels_by_event = build_labels_by_event(recording, assignments)
+    if not labels_by_event:
+        return None, None
+    info = centered_profiles(
+        recording["fitting_arrays"],
+        sorted(labels_by_event),
+        labels_by_event,
+        window_samples=int(window_samples),
+    )
+    medians = pointwise_cluster_medians(info, float(min_coverage_fraction)) if info is not None else {}
+    return info, medians
+
+
+def plot_waveform_family_panels(info, medians, x_mode="time", max_members_per_cluster=50):
+    if info is None or not medians:
+        return None, None
+
+    x = info["time_ms"] if x_mode == "time" else info["data_index"]
+    xlabel = "Time relative to event midpoint (ms)" if x_mode == "time" else "Centered data index"
+    labels = info["labels"]
+    clusters = sorted(medians)
+    n = len(clusters)
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 3.6 * nrows), squeeze=False)
+    axes = axes.ravel()
+
+    for ax in axes[n:]:
+        ax.axis("off")
+
+    for ax, c in zip(axes, clusters):
+        item = medians[c]
+        members = item["members"]
+        show_n = min(max_members_per_cluster, len(members))
+        if show_n > 0:
+            step = max(1, len(members) // show_n)
+            sample = members[::step][:show_n]
+            for prof in sample:
+                ax.plot(x, prof, color="gray", alpha=0.10, linewidth=0.8)
+        ax.plot(x, item["median"], color="red", linewidth=2.0, label="Median representative")
+        ax.set_title(f"Cluster {c} · n={item['n']}")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Blockade (nA)")
+        ax.legend(frameon=False)
+
+    fig.tight_layout()
+
+    overlay, ax = plt.subplots(figsize=(10, 4.8))
+    for c in clusters:
+        ax.plot(x, medians[c]["median"], linewidth=2, label=f"Cluster {c} (n={medians[c]['n']})")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Median blockade (nA)")
+    ax.set_title("Median representative profiles overlaid")
+    ax.legend()
+    overlay.tight_layout()
+    return fig, overlay
+
+
+def plot_histograms_by_cluster(valid, column, xlabel, bins=30):
+    clusters = sorted(valid["cluster"].unique())
+    n = len(clusters)
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 3.4 * nrows), squeeze=False)
+    axes = axes.ravel()
+    for ax in axes[n:]:
+        ax.axis("off")
+    for ax, c in zip(axes, clusters):
+        vals = valid.loc[valid["cluster"] == c, column].replace([np.inf, -np.inf], np.nan).dropna()
+        ax.hist(vals, bins=bins)
+        ax.axvline(np.median(vals), linestyle="--", linewidth=1)
+        ax.set_title(f"Cluster {c} · n={len(vals)}")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Event count")
+    fig.tight_layout()
+    return fig
+
+
+def group_uploaded_triplets(files):
+    grouped = {}
+    pat = re.compile(r"(.+?)(\.dataset|\.event_data|\.event_fitting)\.npz$", flags=re.IGNORECASE)
+    for f in files:
+        m = pat.match(f.name)
+        if not m:
+            continue
+        key, kind = m.group(1), m.group(2).lower()
+        grouped.setdefault(key, {})
+        grouped[key][kind] = f
+    return grouped
+
+
+def guess_salt_label(group_key):
+    token = re.split(r"[_\-]", group_key)[0]
+    return token
+
+
+def lineplot_summary_across_salts(summary_df, ycol, ylabel, title):
+    families = sorted(summary_df["cluster"].unique())
+    salts = list(dict.fromkeys(summary_df["salt"].tolist()))
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for fam in families:
+        g = summary_df[summary_df["cluster"] == fam]
+        g = g.set_index("salt").reindex(salts).reset_index()
+        ax.plot(g["salt"], g[ycol], marker="o", label=f"Family {chr(65 + int(fam))}")
+    ax.set_xlabel("Electrolyte")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def compare_waveform_profiles(results_by_salt, x_mode="time", min_common_families=None):
+    salts = list(results_by_salt.keys())
+    ks = []
+    for salt, item in results_by_salt.items():
+        med = item.get("medians") or {}
+        ks.append(len(med))
+    if not ks or min(ks) == 0:
+        return None
+    n_fam = min(ks) if min_common_families is None else min(min_common_families, min(ks))
+    ncols = 2 if n_fam > 1 else 1
+    nrows = int(np.ceil(n_fam / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 3.5 * nrows), squeeze=False, sharey=True)
+    axes = axes.ravel()
+    for ax in axes[n_fam:]:
+        ax.axis("off")
+    for fam in range(n_fam):
+        ax = axes[fam]
+        for salt, item in results_by_salt.items():
+            info = item["profile_info"]
+            med = item["medians"]
+            if fam not in med:
+                continue
+            x = info["time_ms"] if x_mode == "time" else info["data_index"]
+            ax.plot(x, med[fam]["median"], linewidth=2, label=salt)
+        ax.set_title(f"Family {chr(65 + fam)}")
+        ax.set_xlabel("Time relative to event midpoint (ms)" if x_mode == "time" else "Centered data index")
+        ax.set_ylabel("Median blockade (nA)")
+        ax.legend(frameon=False)
+    fig.suptitle("Matched DNA event families across salts", y=1.01)
+    fig.tight_layout()
+    return fig
+
+
+# -----------------------------
+# UI tabs
+# -----------------------------
 tabs = st.tabs(
     [
         "1 · Load files",
@@ -50,6 +341,7 @@ tabs = st.tabs(
         "3 · ΔI gates",
         "4 · Segment-weighted analysis",
         "5 · Export",
+        "6 · Multi-salt compare",
     ]
 )
 
@@ -77,42 +369,16 @@ with tabs[0]:
             st.error("Upload all three files first.")
         else:
             try:
-                dataset_blob = read_uploaded_bytes(dataset_file)
-                eventdata_blob = read_uploaded_bytes(eventdata_file)
-                fitting_blob = read_uploaded_bytes(fitting_file)
-
-                X, dataset_arrays = load_dataset(dataset_blob)
-                eventdata_arrays = npz_to_dict(eventdata_blob, allow_pickle=True)
-                fitting_arrays = npz_to_dict(fitting_blob, allow_pickle=True)
-
-                df = dataset_table(X)
-
-                fit_to_dataset, ds_status = map_fitting_to_dataset(
-                    fitting_arrays, X, tolerance=float(tolerance)
+                recording = load_recording(
+                    read_uploaded_bytes(dataset_file),
+                    read_uploaded_bytes(eventdata_file),
+                    read_uploaded_bytes(fitting_file),
+                    dataset_file.name,
+                    eventdata_file.name,
+                    fitting_file.name,
+                    float(tolerance),
                 )
-                fit_to_raw, raw_status = map_fitting_to_raw(
-                    fitting_arrays, eventdata_arrays, tolerance=float(tolerance)
-                )
-
-                row_to_fit = {int(row): int(fid) for fid, row in fit_to_dataset.items()}
-                df["event_id"] = [row_to_fit.get(int(i), np.nan) for i in df["dataset_row"]]
-
-                st.session_state.loaded = dict(
-                    X=X,
-                    df=df,
-                    dataset_arrays=dataset_arrays,
-                    eventdata_arrays=eventdata_arrays,
-                    fitting_arrays=fitting_arrays,
-                    fit_to_dataset=fit_to_dataset,
-                    fit_to_raw=fit_to_raw,
-                    ds_status=ds_status,
-                    raw_status=raw_status,
-                    source_names=dict(
-                        dataset=dataset_file.name,
-                        eventdata=eventdata_file.name,
-                        fitting=fitting_file.name,
-                    ),
-                )
+                st.session_state.loaded = recording
                 st.session_state.cluster_result = None
                 st.success("Files loaded.")
             except Exception as exc:
@@ -152,13 +418,10 @@ with tabs[1]:
         st.info("Load the three files in Step 1 first.")
     else:
         df = p["df"].copy()
-
         X_features = df[FEATURE_NAMES].to_numpy(float)
         finite_mask = np.all(np.isfinite(X_features), axis=1)
-
         X_valid = X_features[finite_mask]
         valid_df = df.loc[finite_mask].copy().reset_index(drop=True)
-
         X_scaled, feature_min, feature_max, constant = minmax_scale(X_valid)
 
         if np.any(constant):
@@ -170,62 +433,14 @@ with tabs[1]:
         manual_k = c2.number_input("Manual k", min_value=2, max_value=12, value=4, step=1)
         kmax = c3.number_input("Maximum k to test", min_value=3, max_value=12, value=8, step=1)
         n_init = c4.number_input("K-means initialisations", min_value=10, max_value=300, value=100, step=10)
-
         random_state = st.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1)
 
         if st.button("Run K-means", type="primary"):
             try:
-                scan = scan_k(
-                    X_scaled,
-                    k_min=2,
-                    k_max=int(kmax),
-                    n_init=int(n_init),
-                    max_iter=2000,
-                    random_state=int(random_state),
+                st.session_state.cluster_result = run_kmeans_pipeline(
+                    p, mode, int(manual_k), int(kmax), int(n_init), int(random_state)
                 )
-
-                if mode == "Silhouette":
-                    k = int(scan.loc[scan["silhouette"].idxmax(), "k"])
-                else:
-                    k = int(manual_k)
-
-                labels, centers, inertia = kmeans_numpy(
-                    X_scaled,
-                    k,
-                    n_init=int(n_init),
-                    max_iter=2000,
-                    random_state=int(random_state),
-                )
-
-                labels, label_mapping = reorder_labels_by_height(valid_df, labels)
-                diag = clustering_diagnostics(X_scaled, labels)
-
-                assignments = df.copy()
-                assignments["cluster"] = -1
-                assignments.loc[finite_mask, "cluster"] = labels
-
-                scores, explained, loadings = pca_numpy(X_scaled)
-
-                st.session_state.cluster_result = dict(
-                    k=k,
-                    labels=labels,
-                    assignments=assignments,
-                    valid_mask=finite_mask,
-                    valid_df=valid_df,
-                    X_scaled=X_scaled,
-                    scan=scan,
-                    diagnostics=diag,
-                    inertia=inertia,
-                    scores=scores,
-                    explained=explained,
-                    loadings=loadings,
-                    feature_min=feature_min,
-                    feature_max=feature_max,
-                    n_init=int(n_init),
-                    random_state=int(random_state),
-                    mode=mode,
-                )
-                st.success(f"K-means complete: k={k}")
+                st.success(f"K-means complete: k={st.session_state.cluster_result['k']}")
             except Exception as exc:
                 st.exception(exc)
 
@@ -260,21 +475,7 @@ with tabs[1]:
             st.pyplot(fig, use_container_width=True)
 
             st.subheader("Cluster summary")
-            summary = (
-                valid.groupby("cluster")
-                .agg(
-                    n=("cluster", "size"),
-                    median_blockade_nA=("height_nA", "median"),
-                    median_fwhm_ms=("fwhm_ms", "median"),
-                    median_dwell_ms=("width_ms", "median"),
-                    median_area_nA_ms=("area_nA_ms", "median"),
-                    median_fwhm_fraction=("fwhm_fraction", "median"),
-                    median_skew=("skew", "median"),
-                    median_kurtosis=("kurtosis", "median"),
-                )
-                .reset_index()
-            )
-            summary["population_pct"] = 100 * summary["n"] / summary["n"].sum()
+            summary = cluster_summary_table(valid)
             st.dataframe(summary.round(4), use_container_width=True)
 
             st.subheader("Physical plots")
@@ -282,11 +483,13 @@ with tabs[1]:
                 "Plot",
                 [
                     "Blockade vs dwell",
+                    "Dwell-time histograms by cluster",
+                    "Blockade histograms by cluster",
                     "FWHM vs total width",
                     "FWHM / width",
                     "Area vs dwell",
                     "Population fraction",
-                    "Real midpoint-aligned waveforms",
+                    "Waveform family panels + overlay",
                 ],
             )
 
@@ -298,6 +501,14 @@ with tabs[1]:
                 ax.set_xlabel("Event width / dwell-like duration (ms)")
                 ax.set_ylabel("Blockade height (nA)")
                 ax.legend()
+                st.pyplot(fig, use_container_width=True)
+
+            elif plot_choice == "Dwell-time histograms by cluster":
+                fig = plot_histograms_by_cluster(valid, "width_ms", "Event width / dwell-like duration (ms)", bins=30)
+                st.pyplot(fig, use_container_width=True)
+
+            elif plot_choice == "Blockade histograms by cluster":
+                fig = plot_histograms_by_cluster(valid, "height_nA", "Blockade height (nA)", bins=30)
                 st.pyplot(fig, use_container_width=True)
 
             elif plot_choice == "FWHM vs total width":
@@ -346,37 +557,19 @@ with tabs[1]:
                 st.pyplot(fig, use_container_width=True)
 
             else:
-                row_to_fit = {
-                    int(row): int(fid) for fid, row in p["fit_to_dataset"].items()
-                }
-                labels_by_event = {}
-                for _, row in valid.iterrows():
-                    dsrow = int(row["dataset_row"])
-                    if dsrow in row_to_fit:
-                        labels_by_event[row_to_fit[dsrow]] = int(row["cluster"])
-
-                if not labels_by_event:
-                    st.warning("No matched event-fitting traces available.")
+                c1, c2 = st.columns([1, 1])
+                x_mode = c1.radio("Waveform x-axis", ["time", "data_index"], horizontal=True)
+                win = c2.slider("Centered window (samples)", 200, 3000, 850, 50)
+                info, medians = get_waveform_family_data(p, assignments, window_samples=win)
+                if not medians:
+                    st.warning("No matched event-fitting traces available for family waveforms.")
                 else:
-                    win = st.slider("Centered window (samples)", 200, 3000, 850, 50)
-                    info = centered_profiles(
-                        p["fitting_arrays"],
-                        sorted(labels_by_event),
-                        labels_by_event,
-                        window_samples=win,
+                    fig_panels, fig_overlay = plot_waveform_family_panels(info, medians, x_mode=x_mode)
+                    st.pyplot(fig_panels, use_container_width=True)
+                    st.caption(
+                        "Grey curves are a deterministic sample of real member traces. The red curve is the pointwise median representative profile."
                     )
-                    medians = pointwise_cluster_medians(info, 0.5)
-                    if not medians:
-                        st.warning("Could not build aligned profiles.")
-                    else:
-                        fig, ax = plt.subplots(figsize=(10, 5))
-                        for c, item in medians.items():
-                            ax.plot(info["time_ms"], item["median"], linewidth=2, label=f"Cluster {c} (n={item['n']})")
-                        ax.set_xlabel("Time relative to event midpoint (ms)")
-                        ax.set_ylabel("Median blockade (nA)")
-                        ax.set_title("Real measured waveform families")
-                        ax.legend()
-                        st.pyplot(fig, use_container_width=True)
+                    st.pyplot(fig_overlay, use_container_width=True)
 
             st.subheader("PCA contribution analysis")
             scores = r["scores"]
@@ -707,3 +900,124 @@ with tabs[4]:
             "event-fitting/event-data files wherever they can be matched. Original event IDs are retained rather "
             "than renumbered. A provenance JSON and CSV are included in every group ZIP."
         )
+
+# -------------------------------------------------------------------
+# 6. MULTI-SALT COMPARE
+# -------------------------------------------------------------------
+with tabs[5]:
+    st.header("Multiple salts: compare cluster families across recordings")
+    st.caption(
+        "Upload all NPZ files from several salts together. The app groups matching triplets by filename and runs the same K-means pipeline on each."
+    )
+
+    compare_files = st.file_uploader(
+        "Upload many NPZ files together",
+        type=["npz"],
+        accept_multiple_files=True,
+        key="multi_compare_upload",
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    cmp_mode = c1.radio("Choose k", ["Manual", "Silhouette"], horizontal=False, key="cmp_mode")
+    cmp_manual_k = c2.number_input("Manual k", min_value=2, max_value=12, value=4, step=1, key="cmp_manual_k")
+    cmp_kmax = c3.number_input("Maximum k to test", min_value=3, max_value=12, value=8, step=1, key="cmp_kmax")
+    cmp_n_init = c4.number_input("K-means initialisations", min_value=10, max_value=300, value=100, step=10, key="cmp_n_init")
+    cmp_seed = c5.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1, key="cmp_seed")
+
+    cmp_tol = st.number_input(
+        "Timestamp matching tolerance (s)",
+        min_value=1e-10,
+        max_value=1e-3,
+        value=1e-7,
+        format="%.1e",
+        key="cmp_tol",
+    )
+    cmp_window = st.slider("Centered window for family profiles (samples)", 200, 3000, 850, 50, key="cmp_window")
+    cmp_x_mode = st.radio("Waveform x-axis", ["time", "data_index"], horizontal=True, key="cmp_x_mode")
+
+    if st.button("Run multi-salt comparison", type="primary"):
+        if not compare_files:
+            st.error("Upload the NPZ files first.")
+        else:
+            try:
+                grouped = group_uploaded_triplets(compare_files)
+                complete = {k: v for k, v in grouped.items() if {".dataset", ".event_data", ".event_fitting"}.issubset(v.keys())}
+                if not complete:
+                    raise ValueError("No complete dataset/event_data/event_fitting triplets were found from the uploaded filenames.")
+
+                results_by_salt = {}
+                combined_rows = []
+                for key in sorted(complete):
+                    files = complete[key]
+                    salt = guess_salt_label(key)
+                    rec = load_recording(
+                        read_uploaded_bytes(files[".dataset"]),
+                        read_uploaded_bytes(files[".event_data"]),
+                        read_uploaded_bytes(files[".event_fitting"]),
+                        files[".dataset"].name,
+                        files[".event_data"].name,
+                        files[".event_fitting"].name,
+                        float(cmp_tol),
+                    )
+                    result = run_kmeans_pipeline(
+                        rec,
+                        cmp_mode,
+                        int(cmp_manual_k),
+                        int(cmp_kmax),
+                        int(cmp_n_init),
+                        int(cmp_seed),
+                    )
+                    summary = cluster_summary_table(result["assignments"])
+                    summary.insert(0, "salt", salt)
+                    combined_rows.append(summary)
+                    info, medians = get_waveform_family_data(rec, result["assignments"], window_samples=int(cmp_window))
+                    results_by_salt[salt] = {
+                        "recording": rec,
+                        "result": result,
+                        "summary": summary,
+                        "profile_info": info,
+                        "medians": medians,
+                    }
+
+                summary_df = pd.concat(combined_rows, ignore_index=True)
+                st.session_state.multi_compare = {
+                    "results_by_salt": results_by_salt,
+                    "summary_df": summary_df,
+                    "x_mode": cmp_x_mode,
+                }
+                st.success(f"Loaded and analysed {len(results_by_salt)} salts.")
+            except Exception as exc:
+                st.exception(exc)
+
+    mc = st.session_state.multi_compare
+    if mc:
+        results_by_salt = mc["results_by_salt"]
+        summary_df = mc["summary_df"]
+        st.subheader("Family summary table across salts")
+        pretty = summary_df.copy()
+        pretty["family"] = pretty["cluster"].map(lambda x: f"Family {chr(65 + int(x))}")
+        st.dataframe(pretty[["salt", "family", "n", "population_pct", "median_blockade_nA", "median_dwell_ms", "median_area_nA_ms"]].round(4), use_container_width=True)
+
+        st.subheader("Dwell/blockade summary across salts")
+        c1, c2 = st.columns(2)
+        c1.pyplot(
+            lineplot_summary_across_salts(
+                summary_df, "median_blockade_nA", "Median mean blockade (nA)", "Family-resolved blockade across salts"
+            ),
+            use_container_width=True,
+        )
+        c2.pyplot(
+            lineplot_summary_across_salts(
+                summary_df, "median_dwell_ms", "Median dwell time (ms)", "Family-resolved dwell time across salts"
+            ),
+            use_container_width=True,
+        )
+
+        st.subheader("Matched event-family shapes across salts")
+        fig = compare_waveform_profiles(results_by_salt, x_mode=mc["x_mode"])
+        if fig is None:
+            st.warning("Not enough waveform data available to compare salts.")
+        else:
+            st.pyplot(fig, use_container_width=True)
+            st.caption(
+                "Families are matched by the reordered cluster index (smallest-to-largest median blockade within each salt)."
+            )

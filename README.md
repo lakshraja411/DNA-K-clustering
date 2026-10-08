@@ -71,3 +71,19 @@ Then on Streamlit Community Cloud:
 The clustering uses the NanoSense scalar descriptors exactly as stored in the dataset file. It does **not** claim to duplicate the hidden waveform clustering implementation of the separate NanoSense clustering GUI.
 
 Exported subsets preserve original dataset rows and event-indexed arrays where matching succeeds. Original event IDs remain unchanged.
+
+
+## New in this version
+
+- Midpoint-aligned **waveform family panel plots** for each cluster:
+  - individual family panels with real member traces in grey and the median representative in red
+  - combined overlay plot
+  - x-axis can be either time relative to the event midpoint or centered data index
+- Added **dwell-time histograms by cluster**
+- Added **blockade histograms by cluster**
+- Added a **multi-salt comparison** page:
+  - upload many `.npz` files at once
+  - the app groups matching `dataset`, `event_data`, and `event_fitting` files by filename stem
+  - runs the same K-means settings on each salt
+  - compares family-resolved blockade and dwell across salts
+  - compares matched median family shapes across salts
