@@ -396,6 +396,7 @@ def plot_waveform_family_panels(info, medians, x_mode="time", max_members_per_cl
         ax.plot(
             x,
             item["median"],
+            color="red",
             linewidth=2.2,
             label="Median representative"
         )
@@ -625,7 +626,7 @@ def overlay_histogram_by_salt(df, column, bins=40, density=True, title="", xlabe
     return fig
 
 
-def salt_errorbar_summary(summary, metric, center_mode, title, ylabel):
+def salt_errorbar_summary(summary, metric, center_mode, title, ylabel, plot_style="Line + error bars"):
     q = summary[summary["metric"] == metric].copy()
     order = [s for s in ["LiCl", "NaCl", "KCl", "RbCl", "CsCl"] if s in set(q["salt"])]
     order += [s for s in q["salt"].tolist() if s not in order]
@@ -633,21 +634,23 @@ def salt_errorbar_summary(summary, metric, center_mode, title, ylabel):
 
     if center_mode == "Mean ± SD":
         y = q["mean"].to_numpy(float)
-        err = q["std"].to_numpy(float)
-        yerr = err
+        yerr = q["std"].to_numpy(float)
     elif center_mode == "Mean ± SEM":
         y = q["mean"].to_numpy(float)
-        err = q["sem"].to_numpy(float)
-        yerr = err
+        yerr = q["sem"].to_numpy(float)
     else:
         y = q["median"].to_numpy(float)
         low = y - q["q1"].to_numpy(float)
         high = q["q3"].to_numpy(float) - y
-        yerr = [low, high]
+        yerr = np.vstack([low, high])
 
+    xpos = np.arange(len(q))
     fig, ax = plt.subplots(figsize=(8, 4.8))
-    ax.errorbar(range(len(q)), y, yerr=yerr, marker="o", linewidth=1.5, capsize=4)
-    ax.set_xticks(range(len(q)), q["salt"])
+    if plot_style == "Bar plot":
+        ax.bar(xpos, y, yerr=yerr, capsize=4, alpha=0.85, width=0.68)
+    else:
+        ax.errorbar(xpos, y, yerr=yerr, marker="o", linewidth=1.5, capsize=4)
+    ax.set_xticks(xpos, q["salt"])
     ax.set_title(title)
     ax.set_xlabel("Electrolyte")
     ax.set_ylabel(ylabel)
@@ -2241,6 +2244,12 @@ with tabs[5]:
                 horizontal=True,
                 key="seg_error_mode",
             )
+            seg_plot_style = st.radio(
+                "Summary plot style",
+                ["Line + error bars", "Bar plot"],
+                horizontal=True,
+                key="seg_summary_plot_style",
+            )
             c1, c2 = st.columns(2)
             with c1:
                 opts = plot_editor(
@@ -2255,6 +2264,7 @@ with tabs[5]:
                     seg_error_mode,
                     opts["title"],
                     opts["ylabel"],
+                    plot_style=seg_plot_style,
                 )
                 apply_plot_editor(fig.axes[0], opts)
                 st.pyplot(fig, use_container_width=True)
@@ -2272,6 +2282,7 @@ with tabs[5]:
                     seg_error_mode,
                     opts["title"],
                     opts["ylabel"],
+                    plot_style=seg_plot_style,
                 )
                 apply_plot_editor(fig.axes[0], opts)
                 st.pyplot(fig, use_container_width=True)
